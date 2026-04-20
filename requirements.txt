@@ -1,0 +1,7 @@
+gradio
+chromadb
+llama-index
+llama-index-vector-stores-chroma
+llama-index-llms-ollama
+llama-index-embeddings-ollama
+beautifulsoup4

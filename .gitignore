@@ -1,0 +1,7 @@
+venv/
+chroma_db/
+books/
+ingest.log
+__pycache__/
+*.pyc
+.env
