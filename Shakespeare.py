@@ -49,11 +49,23 @@ def answer(message, history):
     return f"{response}\n{format_sources(response)}"
 
 
-demo = gr.ChatInterface(
-    fn=answer,
-    title="Shakespeare Q&A",
-    description="Ask questions about the complete works of Shakespeare. Answers cite their source PDFs.",
-)
+CSS = """
+textarea, input[type="text"] {
+    border: 1px solid #bbb !important;
+    border-radius: 6px !important;
+}
+textarea:focus, input[type="text"]:focus {
+    border-color: #4a90e2 !important;
+    outline: none !important;
+}
+"""
+
+with gr.Blocks(css=CSS) as demo:
+    gr.ChatInterface(
+        fn=answer,
+        title="Shakespeare Q&A",
+        description="Ask questions about the complete works of Shakespeare. Answers cite their source PDFs.",
+    )
 
 
 if __name__ == "__main__":
