@@ -1,8 +1,7 @@
 venv/
 chroma_db/
 books/
-ingest.log
-shakespeare_ui.log
+*.log
 chat_*.jsonl
 __pycache__/
 *.pyc
