@@ -3,6 +3,7 @@ chroma_db/
 books/
 *.log
 chat_*.jsonl
+query_metrics.jsonl
 __pycache__/
 *.pyc
 .env

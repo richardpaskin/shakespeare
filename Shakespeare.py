@@ -1,4 +1,8 @@
+import json
 import logging
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import chromadb
@@ -7,6 +11,8 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.retrievers import BaseRetriever
+from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.settings import Settings
 from llama_index.core.vector_stores import FilterOperator, MetadataFilter, MetadataFilters
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -15,6 +21,7 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 
 PROJECT_DIR = Path(__file__).parent
 CHROMA_DIR = PROJECT_DIR / "chroma_db"
+METRICS_PATH = PROJECT_DIR / "query_metrics.jsonl"
 
 logging.basicConfig(
     filename=PROJECT_DIR / "llama_index.log",
@@ -77,12 +84,70 @@ PLAY_ALIASES: list[tuple[str, str]] = sorted(
 )
 
 
+def _load_character_pattern() -> tuple[re.Pattern[str] | None, dict[str, str]]:
+    """Compile character_aliases.json (built by build_character_aliases.py) into
+    a single regex. Alternatives are sorted longest-first because Python's `|`
+    is first-match, not longest-match — so "adriano de armado" must precede
+    "adriano" to win when both apply.
+    """
+    path = PROJECT_DIR / "character_aliases.json"
+    if not path.exists():
+        log.warning("character_aliases.json not found — run build_character_aliases.py")
+        return None, {}
+    lookup: dict[str, str] = json.loads(path.read_text(encoding="utf-8"))
+    names = sorted(lookup.keys(), key=len, reverse=True)
+    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b")
+    return pattern, lookup
+
+
+_CHAR_PATTERN, _CHAR_LOOKUP = _load_character_pattern()
+
+
 def detect_work_code(text: str) -> str | None:
     lower = text.lower()
+    # Explicit play mention wins — strongest signal.
     for alias, code in PLAY_ALIASES:
         if alias in lower:
             return code
+    # Fall back to character names unique to one play.
+    if _CHAR_PATTERN is not None:
+        m = _CHAR_PATTERN.search(lower)
+        if m:
+            return _CHAR_LOOKUP[m.group(1)]
     return None
+
+
+class PlayFilterRetriever(BaseRetriever):
+    """Wraps the vector index. At retrieve time the query has already been condensed
+    by the chat engine (pronouns resolved, prior context inlined) — we run the
+    play-name detector on THAT, so a topic change like "Montagues and Capulets"
+    after a Macbeth question is not falsely pinned to Macbeth, and a follow-up
+    like "tell me about him" is correctly resolved to the prior play before
+    detection runs.
+    """
+
+    def __init__(self, vector_index: VectorStoreIndex, top_k: int) -> None:
+        super().__init__()
+        self._index = vector_index
+        self._top_k = top_k
+        # Set so the caller can read what actually happened.
+        self.last_query: str | None = None
+        self.last_work_code: str | None = None
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        condensed = query_bundle.query_str
+        work_code = detect_work_code(condensed)
+        self.last_query = condensed
+        self.last_work_code = work_code
+        log.info("  retriever: condensed=%r work_code=%s", condensed[:200], work_code)
+
+        filters = None
+        if work_code:
+            filters = MetadataFilters(
+                filters=[MetadataFilter(key="work_code", value=work_code, operator=FilterOperator.EQ)]
+            )
+        inner = self._index.as_retriever(similarity_top_k=self._top_k, filters=filters)
+        return inner.retrieve(query_bundle)
 
 
 def load_index():
@@ -156,29 +221,28 @@ def format_sources(response) -> str:
     return "\n".join(lines)
 
 
-def answer(message, history):
-    # Detect a play in the current message OR anywhere in prior history,
-    # so follow-ups like "tell me about Edmund" still filter to King Lear.
-    history_text = _extract_text(history)
-    work_code = detect_work_code(message) or detect_work_code(history_text)
-    log.info(
-        "Q (history=%d turns, work_code=%s): %s",
-        len(history or []),
-        work_code,
-        message,
-    )
+def _record_metric(metric: dict) -> None:
+    try:
+        with METRICS_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(metric) + "\n")
+    except Exception:
+        log.exception("failed to write query metric")
 
-    filters = None
-    if work_code:
-        filters = MetadataFilters(
-            filters=[MetadataFilter(key="work_code", value=work_code, operator=FilterOperator.EQ)]
-        )
-    retriever = index.as_retriever(similarity_top_k=TOP_K, filters=filters)
+
+def answer(message, history):
+    t0 = time.perf_counter()
+    history_turns = len(history or [])
+    log.info("Q (history=%d turns): %s", history_turns, message)
+
+    retriever = PlayFilterRetriever(index, TOP_K)
     chat_engine = CondensePlusContextChatEngine.from_defaults(
         retriever=retriever,
         memory=build_memory(history),
     )
     response = chat_engine.stream_chat(message)
+    setup_s = time.perf_counter() - t0  # condense + retrieve (LLM may have started)
+    work_code = retriever.last_work_code
+    condensed_query = retriever.last_query
     for i, node in enumerate(response.source_nodes):
         meta = node.node.metadata
         snippet = node.node.get_content()[:300].replace("\n", " ").strip()
@@ -191,10 +255,27 @@ def answer(message, history):
             snippet,
         )
     text = ""
+    first_token_s = None
     for token in response.response_gen:
+        if first_token_s is None:
+            first_token_s = time.perf_counter() - t0
         text += token
         yield text
-    log.info("A (%d chars): %s", len(text), text[:500].replace("\n", " "))
+
+    total_s = time.perf_counter() - t0
+    log.info("A (%d chars, %.1fs): %s", len(text), total_s, text[:500].replace("\n", " "))
+    _record_metric({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "question": message[:200],
+        "condensed_query": condensed_query[:200] if condensed_query else None,
+        "work_code": work_code,
+        "history_turns": history_turns,
+        "setup_s": round(setup_s, 3),
+        "first_token_s": round(first_token_s, 3) if first_token_s is not None else None,
+        "total_s": round(total_s, 3),
+        "response_chars": len(text),
+        "num_sources": len(response.source_nodes),
+    })
     yield f"{text}\n{format_sources(response)}"
 
 
